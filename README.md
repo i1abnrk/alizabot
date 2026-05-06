@@ -45,3 +45,11 @@ Indexes are created on `(token_id, distance)` and `(neighbor_id)`.
 - Tokenization is regex-based (alphanumeric plus underscore) and lowercased by default.
 - If you need forward neighbors (t+1..t+5) as well, we can extend the schema with a `direction` column or allow negative distances.
 
+## Training Your Own Data
+
+This project does **not** include any training texts. You provide your own.
+# I train with files from gutenberg.org and recommend it for free books.
+1. Create a folder with your `.txt` files (can be nested):
+   ```bash
+   mkdir my_corpus
+   # put your .txt files in my_corpus/
