@@ -1,11 +1,9 @@
 import argparse
-import os
 import sys
-from typing import List
+from pathlib import Path
 
-from .corpus import iter_token_sequences
-from .db import connect_db, init_schema
-from .indexer import index_token_sequence
+from .context_builder import ContextBuilder
+from .database import DatabaseManager
 
 
 def parse_args() -> argparse.Namespace:
@@ -19,20 +17,21 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
 	args = parse_args()
-	if not os.path.isdir(args.data_dir):
+	data_dir = Path(args.data_dir)
+	db_path = Path(args.db_path)
+	if not data_dir.is_dir():
 		print(f"Data directory not found: {args.data_dir}", file=sys.stderr)
 		return 2
-	conn = connect_db(args.db_path)
-	init_schema(conn)
-	lowercase = not args.no_lowercase
 
-	total_files = 0
-	total_tokens = 0
-	for path, tokens in iter_token_sequences(args.data_dir, lowercase=lowercase, min_len=args.min_token_len):
-		total_files += 1
-		total_tokens += len(tokens)
-		index_token_sequence(conn, tokens)
-	print(f"Indexed {total_tokens} tokens from {total_files} files into {args.db_path}")
+	builder = ContextBuilder(
+		lowercase=not args.no_lowercase,
+		min_token_len=args.min_token_len,
+		max_distance=5,
+	)
+	manager = DatabaseManager(builder)
+	conn = manager.build_or_load(data_dir=data_dir, db_path=db_path)
+	conn.close()
+	print(f"Database ready at {db_path}")
 	return 0
 
 
