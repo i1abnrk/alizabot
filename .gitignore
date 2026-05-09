@@ -1,0 +1,19 @@
+# ================== PRIVATE DATA ==================
+text/
+data/
+corpus/
+training/
+my_corpus/
+
+# Database files
+*.sqlite
+*.sqlite3
+*.db
+artifacts/
+
+# ================== Standard ignores ==================
+__pycache__/
+.venv/
+venv/
+*.pyc
+.DS_Store
