@@ -15,6 +15,14 @@ def parse_args() -> argparse.Namespace:
 		action="store_true",
 		help="Clear co-occurrence tables and rebuild the index from scratch (ignores fingerprints).",
 	)
+	parser.add_argument(
+		"--stream-mode",
+		action=argparse.BooleanOptionalAction,
+		default=True,
+		help="Build one token stream with <FILE_BREAK> between files (default: on). "
+		"Use --no-stream-mode for per-file passes (same counts, lower peak RAM). "
+		"When on, migrates away the legacy file_cooccurrence table if present.",
+	)
 	parser.add_argument("--min-token-len", type=int, default=1, help="Drop tokens shorter than this length.")
 	parser.add_argument("--no-lowercase", action="store_true", help="Disable lowercasing of tokens.")
 	return parser.parse_args()
@@ -34,7 +42,12 @@ def main() -> int:
 		max_distance=5,
 	)
 	manager = DatabaseManager(builder)
-	conn = manager.build_or_load(data_dir=data_dir, db_path=db_path, force_rebuild=args.force_rebuild)
+	conn = manager.build_or_load(
+		data_dir=data_dir,
+		db_path=db_path,
+		force_rebuild=args.force_rebuild,
+		stream_mode=args.stream_mode,
+	)
 	conn.close()
 	print(f"Database ready at {db_path}")
 	return 0

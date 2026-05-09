@@ -1,13 +1,17 @@
 """
-SQLite index orchestration: incremental updates, integrity, and user-facing status.
+SQLite index orchestration: change detection, full co-occurrence rebuilds, and status.
+
+Issue #2: the legacy ``file_cooccurrence`` table is dropped in favor of a lighter DB.
+``indexed_files`` (path, file_size, mtime_ns, …) still records fingerprints so we only
+recompute the global ``cooccurrence`` table when the corpus actually changes.
 
 Manual verification (issue #1 regression checks)
 -----------------------------------------------
 1. Delete ``artifacts/index.sqlite`` (or your ``--db-path``).
 2. Run the indexer CLI; expect: "Database not found -> performing full clean build".
 3. Run the same command again immediately; expect: "No changes detected -> loading existing database".
-4. Touch or open+save one corpus ``.txt`` file, run indexer; expect a message that
-   only that file changed (incremental update).
+4. Touch or open+save one corpus ``.txt`` file, run indexer; expect a fingerprint-driven
+   full co-occurrence rebuild (not a per-file SQL merge).
 5. Run with ``--force-rebuild``; expect a full rebuild every time regardless of fingerprints.
 
 See also: ``ContextBuilder.get_changed_files`` uses (size, mtime_ns) fingerprints to avoid
@@ -69,7 +73,6 @@ def _write_manifest(conn: sqlite3.Connection, digest: str) -> None:
 
 def _clear_incremental_tables(conn: sqlite3.Connection) -> None:
     """Remove co-occurrence and file tracking so a rebuild starts from a blank slate."""
-    conn.execute("DELETE FROM file_cooccurrence")
     conn.execute("DELETE FROM cooccurrence")
     conn.execute("DELETE FROM indexed_files")
     conn.execute("DELETE FROM index_metadata")
@@ -89,12 +92,27 @@ class DatabaseManager:
         conn.execute("PRAGMA foreign_keys=ON;")
         return conn
 
+    def drop_file_cooccurrence_table(self, conn: sqlite3.Connection) -> None:
+        """
+        Migration helper: remove the legacy per-file co-occurrence table if present.
+
+        Dropping it shrinks the database; global ``cooccurrence`` is rebuilt from disk
+        when fingerprints indicate a corpus change.
+        """
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'file_cooccurrence'"
+        ).fetchone()
+        if row is not None:
+            print("Dropping legacy file_cooccurrence table for size optimization...")
+            conn.execute("DROP TABLE file_cooccurrence")
+
     def build_or_load(
         self,
         data_dir: str | Path,
         db_path: str | Path,
         *,
         force_rebuild: bool = False,
+        stream_mode: bool = True,
     ) -> sqlite3.Connection:
         data_path = Path(data_dir)
         db_file = Path(db_path)
@@ -103,6 +121,8 @@ class DatabaseManager:
         conn = self.get_connection(db_file)
         self.context_builder.initialize(conn)
         self.context_builder.migrate_path_keys_to_canonical(conn)
+        if stream_mode:
+            self.drop_file_cooccurrence_table(conn)
         conn.commit()
 
         all_files: List[Path] = list(iter_text_files(data_path))
@@ -116,7 +136,9 @@ class DatabaseManager:
             _clear_incremental_tables(conn)
             conn.commit()
             print(f"Indexing {len(all_files)} files (full rebuild)...")
-            processed = self.context_builder.update_files(conn, all_files)
+            processed = self.context_builder.rebuild_corpus_cooccurrence(
+                conn, all_files, stream_mode=stream_mode
+            )
             conn.commit()
             manifest = _compute_corpus_manifest_sha256(data_path, all_files)
             _write_manifest(conn, manifest)
@@ -130,7 +152,9 @@ class DatabaseManager:
         if not db_existed_before:
             print("Database not found -> performing full clean build.")
             print(f"Indexing {len(all_files)} files...")
-            processed = self.context_builder.update_files(conn, all_files)
+            processed = self.context_builder.rebuild_corpus_cooccurrence(
+                conn, all_files, stream_mode=stream_mode
+            )
             conn.commit()
             manifest = _compute_corpus_manifest_sha256(data_path, all_files)
             _write_manifest(conn, manifest)
@@ -144,40 +168,45 @@ class DatabaseManager:
         indexed_paths = set(self.context_builder.list_indexed_paths(conn))
         current_paths: Set[str] = {canonical_index_path(p) for p in all_files}
         stale_paths = sorted(indexed_paths - current_paths)
+        removed_stale = 0
         if stale_paths:
-            removed = self.context_builder.purge_stale_paths(conn, stale_paths)
+            removed_stale = self.context_builder.purge_stale_paths(conn, stale_paths)
             conn.commit()
-            print(f"Removed {removed} missing file(s) from the index (deleted or moved on disk).")
+            print(f"Removed {removed_stale} missing file(s) from the index (deleted or moved on disk).")
 
         manifest = _compute_corpus_manifest_sha256(data_path, all_files)
         manifest_stored = _read_manifest(conn)
         changed_files = self.context_builder.get_changed_files(conn, all_files)
 
-        if not changed_files and manifest == manifest_stored:
+        if not changed_files and manifest == manifest_stored and removed_stale == 0:
             print("No changes detected -> loading existing database.")
             self._finalize_post_build(conn, data_path, db_file, processed_paths=[], full_rebuild=False)
             return conn
 
-        if not changed_files and manifest != manifest_stored:
+        if not changed_files and manifest != manifest_stored and removed_stale == 0:
             _write_manifest(conn, manifest)
             conn.commit()
             print("Index data matches files on disk; updated corpus manifest only.")
             self._finalize_post_build(conn, data_path, db_file, processed_paths=[], full_rebuild=False)
             return conn
 
-        print(f"{len(changed_files)} file(s) changed -> updating index incrementally.")
-        processed = self.context_builder.update_files(conn, changed_files)
+        reason = f"{len(changed_files)} file(s) fingerprinted as changed" if changed_files else "index/corpus mismatch"
+        if removed_stale:
+            reason = f"{reason}; removed {removed_stale} stale path(s)" if changed_files else f"removed {removed_stale} stale path(s)"
+        print(f"{reason} -> rebuilding global co-occurrence from corpus ({len(all_files)} file(s)).")
+        processed = self.context_builder.rebuild_corpus_cooccurrence(
+            conn, all_files, stream_mode=stream_mode
+        )
         conn.commit()
         _write_manifest(conn, manifest)
         conn.commit()
-        print(f"Incremental update complete. Processed {processed} file(s).")
-        full_corpus_touch = len(changed_files) >= len(all_files)
+        print(f"Rebuild complete. Refreshed metadata for {processed} file(s).")
         self._finalize_post_build(
             conn,
             data_path,
             db_file,
-            processed_paths=changed_files,
-            full_rebuild=full_corpus_touch,
+            processed_paths=all_files,
+            full_rebuild=True,
         )
         return conn
 
