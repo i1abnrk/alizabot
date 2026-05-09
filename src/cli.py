@@ -10,6 +10,11 @@ def parse_args() -> argparse.Namespace:
 	parser = argparse.ArgumentParser(description="Build 5-distance token co-occurrence index (t-1..t-5).")
 	parser.add_argument("--data-dir", required=True, help="Root directory containing .txt files (recursive).")
 	parser.add_argument("--db-path", required=True, help="Path to SQLite database to create/update.")
+	parser.add_argument(
+		"--force-rebuild",
+		action="store_true",
+		help="Clear co-occurrence tables and rebuild the index from scratch (ignores fingerprints).",
+	)
 	parser.add_argument("--min-token-len", type=int, default=1, help="Drop tokens shorter than this length.")
 	parser.add_argument("--no-lowercase", action="store_true", help="Disable lowercasing of tokens.")
 	return parser.parse_args()
@@ -29,7 +34,7 @@ def main() -> int:
 		max_distance=5,
 	)
 	manager = DatabaseManager(builder)
-	conn = manager.build_or_load(data_dir=data_dir, db_path=db_path)
+	conn = manager.build_or_load(data_dir=data_dir, db_path=db_path, force_rebuild=args.force_rebuild)
 	conn.close()
 	print(f"Database ready at {db_path}")
 	return 0

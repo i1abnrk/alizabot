@@ -1,7 +1,28 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Tuple
+
+
+def canonical_index_path(path: Path) -> str:
+    """
+    Stable absolute path string for SQLite index keys.
+
+    On Windows, paths are case-insensitive; normalize so the same file is not
+    indexed twice under different casings (e.g. OneDrive / tooling quirks).
+    """
+    resolved = path.resolve()
+    s = resolved.as_posix()
+    if os.name == "nt":
+        return s.casefold()
+    return s
+
+
+def file_stat_fingerprint(path: Path) -> Tuple[int, int]:
+    """Return (size_bytes, mtime_ns) for robust change detection (no SQLite REAL rounding)."""
+    st = path.stat()
+    return (st.st_size, st.st_mtime_ns)
 
 
 def iter_text_files(data_dir: Path) -> Iterable[Path]:
@@ -24,6 +45,14 @@ def newest_text_mtime(data_dir: Path) -> Optional[float]:
 def ensure_parent_dir(path: Path) -> None:
     """Ensure that path's parent directory exists."""
     path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def total_text_bytes(data_dir: Path) -> int:
+    """Sum of file sizes for all .txt files under data_dir (recursive)."""
+    total = 0
+    for p in iter_text_files(data_dir):
+        total += p.stat().st_size
+    return total
 
 
 def read_text_robust(path: Path) -> str:

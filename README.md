@@ -32,3 +32,12 @@ mkdir my_corpus
 
 # 5. Build / update the index
 python -m src.cli --data-dir "./my_corpus" --db-path "artifacts/index.sqlite"
+
+## Important Flags
+
+```powershell
+# Normal incremental build (recommended)
+python -m src.cli --data-dir "./my_corpus" --db-path "artifacts/index.sqlite"
+
+# Force clean rebuild (if you changed tokenization rules or want to start fresh)
+python -m src.cli --data-dir "./my_corpus" --db-path "artifacts/index.sqlite" --force-rebuild
