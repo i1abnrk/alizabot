@@ -4,6 +4,7 @@ data/
 corpus/
 training/
 my_corpus/
+grok.yaml
 
 # Database files
 *.sqlite
