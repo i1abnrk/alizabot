@@ -32,6 +32,7 @@ mkdir my_corpus
 
 # 5. Build / update the index
 python -m src.cli --data-dir "./my_corpus" --db-path "artifacts/index.sqlite"
+```
 
 ## Important Flags
 
@@ -41,3 +42,24 @@ python -m src.cli --data-dir "./my_corpus" --db-path "artifacts/index.sqlite"
 
 # Force clean rebuild (if you changed tokenization rules or want to start fresh)
 python -m src.cli --data-dir "./my_corpus" --db-path "artifacts/index.sqlite" --force-rebuild
+```
+
+## Quick Start — live console (v0.1.2)
+
+Cross-platform: use `pathlib`-style paths; default DB is `./artifacts/index.sqlite` relative to the current working directory unless you override it.
+
+**Linux / macOS (bash):**
+
+```bash
+export ALIZABOT_DB_PATH=./artifacts/index.sqlite
+python -m alizabot.console --db ./artifacts/index.sqlite
+```
+
+**Windows (PowerShell):**
+
+```powershell
+$env:ALIZABOT_DB_PATH = "./artifacts/index.sqlite"
+python -m alizabot.console --db ./artifacts/index.sqlite
+```
+
+Each line you type is indexed first, then the reply is generated from the updated database (stdlib SQLite only).
