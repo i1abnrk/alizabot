@@ -10,10 +10,6 @@ from .db import get_or_create_token_id, get_or_create_token_ids, init_schema
 from .tokenizer import tokenize
 from .utils import canonical_index_path, file_stat_fingerprint, read_text_robust
 
-# Inserted between files when building a single token stream so neighbor windows never
-# span corpus boundaries (Issue #2: replaces per-file SQLite storage).
-FILE_BREAK = "<FILE_BREAK>"
-
 CooccurrenceKey = Tuple[int, int, int]
 
 
@@ -233,24 +229,4 @@ class ContextBuilder:
             (path_key, st.st_size, st.st_mtime_ns, st.st_mtime, time.time()),
         )
 
-    def _build_file_updates(self, token_ids: Dict[str, int], tokens: List[str]) -> Dict[CooccurrenceKey, int]:
-        """Count directed neighbor pairs; FILE_BREAK is not a token id and must not participate."""
-        updates: Dict[CooccurrenceKey, int] = defaultdict(int)
-        token_count = len(tokens)
-        for i in range(token_count):
-            if tokens[i] == FILE_BREAK:
-                continue
-            token_id = token_ids.get(tokens[i])
-            if token_id is None:
-                continue
-            for distance in range(1, self.max_distance + 1):
-                j = i - distance
-                if j < 0:
-                    break
-                if tokens[j] == FILE_BREAK:
-                    continue
-                neighbor_id = token_ids.get(tokens[j])
-                if neighbor_id is None:
-                    continue
-                updates[(token_id, neighbor_id, distance)] += 1
-        return updates
+    # _build_file_updates removed during cleanup (no longer used after streaming window refactor)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, List, Tuple
 
 
 def canonical_index_path(path: Path) -> str:
@@ -30,16 +30,6 @@ def iter_text_files(data_dir: Path) -> Iterable[Path]:
     for path in data_dir.rglob("*.txt"):
         if path.is_file():
             yield path
-
-
-def newest_text_mtime(data_dir: Path) -> Optional[float]:
-    """Return the newest mtime across .txt files, or None when empty."""
-    newest: Optional[float] = None
-    for text_file in iter_text_files(data_dir):
-        mtime = text_file.stat().st_mtime
-        if newest is None or mtime > newest:
-            newest = mtime
-    return newest
 
 
 def ensure_parent_dir(path: Path) -> None:

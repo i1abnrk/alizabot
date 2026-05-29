@@ -89,21 +89,20 @@ class ChancePie:
 
 
 class WorkPicker:
-    """5-distance weighted picker matching original AlizaGameAPI logic.
+    """5-distance weighted picker.
 
-    distance_mode: boolean switch for distance weighting formula
-        True  (bonus)   → close context stronger
-        False (inverted)→ gentler curve favoring slightly more distant context
+    distance_mode controls the distance weighting formula:
+        True  → (1+k) ** distance                 (bonus / close-is-strong)
+        False → (1+k) ** (window_size - distance)   (inverted)
     """
 
     def __init__(self, db_path: str, k: float = 0.04, first_stage_size: int = 121,
-                 distance_mode: bool = True) -> None:
+                 distance_mode: bool = True, window_size: int = 5) -> None:
         self.conn = sqlite3.connect(db_path)
         self.k = k
-        self.base = 1.0 + k
         self.first_stage_size = first_stage_size
-        self.distance_mode = distance_mode   # boolean control surface
-        self.max_d = 5
+        self.distance_mode = distance_mode     # boolean control surface
+        self.window_size = window_size         # context window size (BERT-style "stride")
 
     def get_next_token(self, context: List[str]) -> Optional[str]:
         """Given a list of previous tokens, return the next token."""
@@ -148,17 +147,22 @@ class WorkPicker:
 
         return " ".join(reply_tokens) if reply_tokens else "…"
 
-    def _pad_to_five(self, context: List[str]) -> List[str]:
-        """Keep the last five tokens; pad on the left with ``<PAD>`` if needed."""
-        tail = list(context[-5:]) if len(context) >= 5 else list(context)
-        if len(tail) < 5:
-            tail = [_CONTEXT_PAD] * (5 - len(tail)) + tail
+    def _pad_to_window(self, context: List[str]) -> List[str]:
+        """Keep the last `window_size` tokens; pad on the left with ``<PAD>`` if needed."""
+        n = self.window_size
+        tail = list(context[-n:]) if len(context) >= n else list(context)
+        if len(tail) < n:
+            tail = [_CONTEXT_PAD] * (n - len(tail)) + tail
         return tail
 
     def _get_weighted_candidates(self, context: List[str]) -> List[WeightedToken]:
-        """Core logic: for each of the last 5 tokens, get candidates at that distance,
-        compute (count / total_at_d) * (1 + k)^d, then combine scores."""
-        window = self._pad_to_five(context)
+        """Core logic: for each of the last `window_size` tokens, get candidates at that distance,
+        compute (count / total_at_d) * distance_weight, then combine scores.
+
+        distance_weight = (1+k) ** distance      if distance_mode else
+                          (1+k) ** (window_size - distance)
+        """
+        window = self._pad_to_window(context)
         # Map context surface forms to ids (unknown tokens, including PAD, are skipped).
         rows = self.conn.execute(
             f"SELECT text, id FROM tokens WHERE text IN ({','.join('?' * len(window))})",
@@ -169,7 +173,7 @@ class WorkPicker:
         scores: Dict[int, float] = defaultdict(float)
 
         for slot, surface in enumerate(window):
-            distance = 5 - slot
+            distance = self.window_size - slot
             neighbor_id = text_to_id.get(surface)
             if neighbor_id is None:
                 continue
@@ -186,12 +190,12 @@ class WorkPicker:
             if total <= 0.0:
                 continue
 
+            # distance_weight formula as specified:
+            # (1+k) ** distance if distance_mode else (window_size - distance)
             if self.distance_mode:
-                # bonus / classic: close context stronger
                 dist_weight = (1 + self.k) ** distance
             else:
-                # inverted: gentler curve
-                dist_weight = (1 + self.k) ** (self.max_d - distance)
+                dist_weight = (1 + self.k) ** (self.window_size - distance)
 
             boost = dist_weight
             cur = self.conn.execute(
