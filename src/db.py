@@ -85,6 +85,16 @@ def upsert_cooccurrence_batch(
 		)
 
 
+# === DEPRECATED (Live Path - Abandoned May 2026) ===
+# The entire chat_* schema and helper functions below were part of the
+# "live path" shortcut. They are no longer used for new development.
+# All live user input must now feed the main tokens + cooccurrence tables
+# so that WorkPicker + ChancePie (the original research path) can operate on them.
+#
+# Kept under deprecated markers during transition for safety.
+# Will be removed once the single-engine path is validated.
+# ============================================================
+
 # ---------------------------------------------------------------------------
 # Live console v0.1.2 — logical schema (token, count / from, to, distance,
 # occurrences) is stored in ``chat_*`` tables so this file can coexist with the
@@ -226,3 +236,4 @@ def chat_token_text(conn: sqlite3.Connection, token_id: int) -> Optional[str]:
 	row = conn.execute("SELECT token FROM chat_tokens WHERE id = ?", (token_id,)).fetchone()
 	return str(row[0]) if row else None
 
+# === END DEPRECATED (Live Path - chat_* functions) ===

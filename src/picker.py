@@ -6,6 +6,20 @@ The Java-era stack used ``WordPicker`` plus ``ChancePie`` roulette stages; this
 changing ``console.py``.
 """
 
+# === DEPRECATED (Live Path - Abandoned May 2026) ===
+# This entire module represents the "live path" (chat_* tables + simplified scoring).
+# It was introduced as a quick interactive shortcut (associated with early web frontend work)
+# but short-circuits the original research (5-distance co-occurrence + WorkPicker + ChancePie
+# + Bayesian-style candidate weighting).
+#
+# Per user directive: We are abandoning this path. All new interfaces (CLI, future web,
+# Twitch, etc.) must go through the single engine in inference.py (WorkPicker + ChancePie).
+#
+# Conservative deprecation: Code is kept intact with these markers for safety during transition.
+# It will be removed only after the new single-engine path (with live updates to the main DB)
+# is fully validated.
+# ============================================================
+
 from __future__ import annotations
 
 import random
@@ -113,3 +127,5 @@ def generate_reply(user_input: str, *, rng: random.Random | None = None) -> str:
 			reply_tokens.append(word)
 
 	return " ".join(reply_tokens) if reply_tokens else "…"
+
+# === END DEPRECATED (Live Path) ===

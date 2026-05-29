@@ -1,5 +1,12 @@
 """Corpus batch indexer + live v0.1.2 ``index_text`` (whitespace, distance 1–5)."""
 
+# === DEPRECATED (Live Path - Abandoned May 2026) ===
+# The `index_text` function and related helpers below were the live indexing
+# mechanism for the abandoned chat_* path. They should no longer be used.
+# New live indexing must target the main cooccurrence tables so WorkPicker
+# can consume them.
+# ============================================================
+
 from __future__ import annotations
 
 from collections import defaultdict
@@ -67,3 +74,5 @@ def index_text(text: str) -> None:
 				if to_id is None:
 					continue
 				update_chat_cooccurrence(conn, from_id, to_id, d, increment=1)
+
+# === END DEPRECATED (Live Path - index_text) ===
