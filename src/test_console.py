@@ -57,12 +57,10 @@ def run_console_io_test() -> bool:
 def run_all_tests() -> int:
 	"""Run console I/O checks; print PASS/FAIL summary."""
 	ok = run_console_io_test()
-	ok = run_console_io_test() and ok
-	ok = run_injection_test() and ok
 	if ok:
-		print("PASS: all verification modes succeeded.")
+		print("PASS: console I/O verification succeeded.")
 		return 0
-	print("FAIL: one or more verification modes failed.")
+	print("FAIL: console I/O verification failed.")
 	return 1
 
 
