@@ -6,7 +6,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
-from .db import get_or_create_token_ids, init_schema
+from .db import get_or_create_token_id, get_or_create_token_ids, init_schema
 from .tokenizer import tokenize
 from .utils import canonical_index_path, file_stat_fingerprint, read_text_robust
 
@@ -149,41 +149,52 @@ class ContextBuilder:
         self, conn: sqlite3.Connection, files: Iterable[Path], *, stream_mode: bool = True
     ) -> int:
         """
-        Replace global cooccurrence from the full corpus on disk.
+        Streaming rebuild using a sliding window of up to 5 previous tokens.
 
-        Without file_cooccurrence, edits cannot be merged by subtracting old per-file
-        counts; fingerprints still tell us *whether* to run this full recompute.
+        Processes file by file. Between files the window is reset (no cross-file
+        connections). At the start of each file the window fades in naturally.
+        At the end of a file the remaining context is processed (fade out).
 
-        stream_mode: if True, one token list with FILE_BREAK between files (matches
-        multi-file streaming semantics). If False, accumulate per-file counts (same
-        math, lower peak memory for very large corpora).
+        This matches the desired behavior: a moving window of 5 tokens while
+        reading the corpus sequentially.
         """
         files_list = list(files)
         merged: Dict[CooccurrenceKey, int] = defaultdict(int)
 
-        if stream_mode:
-            stream: List[str] = []
-            for idx, file_path in enumerate(files_list):
-                text = read_text_robust(file_path)
-                toks = tokenize(text, lowercase=self.lowercase, min_len=self.min_token_len)
-                stream.extend(toks)
-                if idx < len(files_list) - 1:
-                    stream.append(FILE_BREAK)
-            real_tokens = [t for t in stream if t != FILE_BREAK]
-            if real_tokens:
-                token_ids = get_or_create_token_ids(conn, real_tokens)
-                for key, delta in self._build_file_updates(token_ids, stream).items():
-                    merged[key] += delta
-        else:
-            for file_path in files_list:
-                text = read_text_robust(file_path)
-                toks = tokenize(text, lowercase=self.lowercase, min_len=self.min_token_len)
-                if not toks:
-                    continue
-                token_ids = get_or_create_token_ids(conn, toks)
-                for key, delta in self._build_file_updates(token_ids, toks).items():
-                    merged[key] += delta
+        # Local cache so we only hit the DB for truly new tokens
+        token_cache: Dict[str, int] = {}
 
+        def _get_id(text: str) -> int:
+            if text in token_cache:
+                return token_cache[text]
+            tid = get_or_create_token_id(conn, text)
+            token_cache[text] = tid
+            return tid
+
+        for file_path in files_list:
+            text = read_text_robust(file_path)
+            toks = tokenize(text, lowercase=self.lowercase, min_len=self.min_token_len)
+            if not toks:
+                continue
+
+            context: list[int] = []  # sliding window of previous token ids (max 5)
+
+            for token in toks:
+                current_id = _get_id(token)
+
+                # For each of the previous tokens in the window (distance 1 is closest)
+                for distance, prev_id in enumerate(reversed(context), start=1):
+                    merged[(current_id, prev_id, distance)] += 1
+
+                # Advance the window
+                context.append(current_id)
+                if len(context) > self.max_distance:
+                    context.pop(0)
+
+            # After the file the window naturally fades out — we simply do not carry
+            # it to the next file. This gives clean separation between documents.
+
+        # Write everything in one go (force rebuild)
         with conn:
             conn.execute("DELETE FROM cooccurrence")
             if merged:

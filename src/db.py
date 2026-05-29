@@ -57,16 +57,40 @@ def safe_execute(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> sqli
 def get_or_create_token_ids(
 	conn: sqlite3.Connection, tokens: Iterable[str]
 ) -> Dict[str, int]:
+	"""Safe version: batches the lookup to avoid SQLite variable limit."""
 	unique = list(dict.fromkeys(tokens))
 	if not unique:
 		return {}
+
+	result: Dict[str, int] = {}
+
+	# First, insert all (safe, executemany handles large lists)
 	with conn:
 		conn.executemany("INSERT OR IGNORE INTO tokens(text) VALUES (?)", ((t,) for t in unique))
-	cur = conn.execute(
-		"SELECT text, id FROM tokens WHERE text IN ({})".format(",".join("?" * len(unique))),
-		unique,
-	)
-	return {row[0]: row[1] for row in cur.fetchall()}
+
+	# Then fetch in safe batches (SQLite typically limits ~999 variables per query)
+	BATCH = 400
+	for i in range(0, len(unique), BATCH):
+		batch = unique[i : i + BATCH]
+		if not batch:
+			continue
+		placeholders = ",".join("?" * len(batch))
+		cur = conn.execute(
+			f"SELECT text, id FROM tokens WHERE text IN ({placeholders})",
+			batch,
+		)
+		for text, tid in cur.fetchall():
+			result[text] = tid
+
+	return result
+
+
+def get_or_create_token_id(conn: sqlite3.Connection, token: str) -> int:
+	"""Single token version for streaming use cases. Returns the integer id."""
+	with conn:
+		conn.execute("INSERT OR IGNORE INTO tokens(text) VALUES (?)", (token,))
+	row = conn.execute("SELECT id FROM tokens WHERE text = ?", (token,)).fetchone()
+	return int(row[0])
 
 
 def upsert_cooccurrence_batch(
