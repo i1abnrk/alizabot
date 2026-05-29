@@ -89,13 +89,21 @@ class ChancePie:
 
 
 class WorkPicker:
-    """5-distance weighted picker matching original AlizaGameAPI logic."""
+    """5-distance weighted picker matching original AlizaGameAPI logic.
 
-    def __init__(self, db_path: str, k: float = 0.04, first_stage_size: int = 121) -> None:
+    distance_mode: boolean switch for distance weighting formula
+        True  (bonus)   → close context stronger
+        False (inverted)→ gentler curve favoring slightly more distant context
+    """
+
+    def __init__(self, db_path: str, k: float = 0.04, first_stage_size: int = 121,
+                 distance_mode: bool = True) -> None:
         self.conn = sqlite3.connect(db_path)
         self.k = k
         self.base = 1.0 + k
         self.first_stage_size = first_stage_size
+        self.distance_mode = distance_mode   # boolean control surface
+        self.max_d = 5
 
     def get_next_token(self, context: List[str]) -> Optional[str]:
         """Given a list of previous tokens, return the next token."""
@@ -110,6 +118,35 @@ class WorkPicker:
 
         final = ChancePie(shortlist)
         return final.pick()
+
+    def generate_reply(self, text: str, *, rng: random.Random | None = None) -> str:
+        """
+        High-level convenience method that mimics the old generate_reply behavior.
+
+        Generates a reply whose length is roughly 0.75x – 1.25x the number of
+        tokens in the input query. This is the method the web UI and other
+        higher-level callers should use instead of manually driving get_next_token.
+        """
+        rng = rng or random.Random()
+
+        user_tokens = text.split()
+        user_len = len(user_tokens)
+        if user_len == 0:
+            return "…"
+
+        target_len = max(1, int(user_len * rng.uniform(0.75, 1.25)))
+
+        reply_tokens: list[str] = []
+        context = list(user_tokens)
+
+        while len(reply_tokens) < target_len:
+            next_token = self.get_next_token(context)
+            if next_token is None or next_token == "<PAD>":
+                break
+            reply_tokens.append(next_token)
+            context.append(next_token)
+
+        return " ".join(reply_tokens) if reply_tokens else "…"
 
     def _pad_to_five(self, context: List[str]) -> List[str]:
         """Keep the last five tokens; pad on the left with ``<PAD>`` if needed."""
@@ -149,7 +186,14 @@ class WorkPicker:
             if total <= 0.0:
                 continue
 
-            boost = math.pow(self.base, float(distance))
+            if self.distance_mode:
+                # bonus / classic: close context stronger
+                dist_weight = (1 + self.k) ** distance
+            else:
+                # inverted: gentler curve
+                dist_weight = (1 + self.k) ** (self.max_d - distance)
+
+            boost = dist_weight
             cur = self.conn.execute(
                 """
                 SELECT token_id, count

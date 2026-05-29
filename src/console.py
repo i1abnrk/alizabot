@@ -7,7 +7,6 @@ then replies generated via the Bayesian/WorkPicker path.
 
 from __future__ import annotations
 
-import random
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -57,26 +56,7 @@ def run_console_iteration(
 
 	engine = _get_engine()
 
-	# === Current reply length rule (temporary hack) ===
-	# Target length = 0.75x – 1.25x the number of tokens in the user query.
-	# This gives more natural-feeling response lengths than hard 6-25 clamping.
-	# Eventually this can be replaced with something smarter.
-	user_tokens = user_input.split()
-	user_len = len(user_tokens)
-	target_len = max(1, int(user_len * random.uniform(0.75, 1.25)))
-
-	reply_tokens: list[str] = []
-	context = list(user_tokens)   # start context with the user's tokens
-
-	# Repeatedly call the real WorkPicker.get_next_token until we hit target length
-	while len(reply_tokens) < target_len:
-		next_token = engine.get_next_token(context)
-		if next_token is None or next_token == "<PAD>":
-			break
-		reply_tokens.append(next_token)
-		context.append(next_token)
-
-	reply = " ".join(reply_tokens) if reply_tokens else "…"
+	reply = engine.generate_reply(user_input)
 	print_fn(f"Aliza> {reply}")
 	return True
 
