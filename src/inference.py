@@ -124,6 +124,20 @@ class ChancePie:
     def pick(self) -> Optional[int]:
         return self.get()
 
+    def get_count(self, token_id: int) -> float:
+        return self._counts.get(token_id, 0.0)
+
+    def set_count(self, token_id: int, new_count: float) -> None:
+        """Update the count/weight for a token_id and mark for rebuild."""
+        old = self._counts.get(token_id, 0.0)
+        self._counts[token_id] = max(0.0, float(new_count))
+        self._total += (self._counts[token_id] - old)
+        self._dirty = True
+
+    def candidates(self) -> List[int]:
+        """Return list of current candidate token_ids in this pie."""
+        return list(self._counts.keys())
+
     @classmethod
     def from_context(
         cls,
@@ -135,7 +149,10 @@ class ChancePie:
     ) -> "ChancePie":
         """Builds a ChancePie directly from DB using integer token_ids.
 
-        Distance weighting is applied at population time via weighted put().
+        This loads the raw cooccurrence data for the context.
+        Heuristics such as distance weighting belong in WorkPicker, not here,
+        to maintain clean separation between data (Model = ChancePie) and
+        logic/heuristics (Controller = WorkPicker).
         """
         n = window_size
         tail = list(context[-n:]) if len(context) >= n else list(context)
@@ -169,11 +186,7 @@ class ChancePie:
             if total <= 0.0:
                 continue
 
-            if distance_mode:
-                dist_weight = (1 + k) ** distance
-            else:
-                dist_weight = (1 + k) ** (n - distance)
-
+            # Raw counts only — distance weighting applied later in WorkPicker
             cur = conn.execute(
                 "SELECT token_id, count FROM cooccurrence "
                 "WHERE neighbor_id = ? AND distance = ?",
@@ -182,9 +195,8 @@ class ChancePie:
 
             for token_id, count in cur:
                 base = (float(count) / total) if total > 0 else 0.0
-                effective = base * dist_weight
-                if effective > 0:
-                    pie.put(int(token_id), effective)
+                if base > 0:
+                    pie.put(int(token_id), base)
 
         return pie
 
@@ -229,6 +241,92 @@ class WorkPicker:
         self._text_to_id[text] = token_id
         return text
 
+    def _apply_weights(self, pie: ChancePie, context_ids: List[int], recent_output: List[str] = None) -> ChancePie:
+        """Apply weighting heuristics to the pie in a defined sequence.
+
+        Default sequence:
+            1. bayes_weight (relevance to input tokens)
+            2. distance_weight
+            3. repetition_penalty (half-life 2 ** -distance over recent output tokens)
+        """
+        pie = self._apply_bayes_weight(pie, context_ids)
+        pie = self._apply_distance_weight(pie)
+        pie = self._apply_repetition_penalty(pie, recent_output or [])
+        return pie
+
+    def _apply_bayes_weight(self, pie: ChancePie, context_ids: List[int]) -> ChancePie:
+        """Apply the bayes relevance scoring as described.
+
+        For a candidate, score = sum over input tokens of 
+        (sum of distances for the pair / len(input))
+        """
+        if not context_ids:
+            return pie
+
+        n_input = len(context_ids)
+
+        # Fast path using precomputed token_pair_stats (populated at index time)
+        for candidate_id in pie.candidates():
+            # Sum distance_sum for all (input_id, candidate_id) pairs in either direction
+            placeholders = ",".join("?" * len(context_ids))
+            params = context_ids + [candidate_id] + context_ids + [candidate_id]
+
+            row = self.conn.execute(
+                f"""
+                SELECT COALESCE(SUM(distance_sum), 0)
+                FROM token_pair_stats
+                WHERE (token_a IN ({placeholders}) AND token_b = ?)
+                   OR (token_a = ? AND token_b IN ({placeholders}))
+                """,
+                params
+            ).fetchone()
+
+            pair_sum = float(row[0]) if row else 0.0
+            score = pair_sum / n_input
+
+            current = pie.get_count(candidate_id)
+            new_val = current * score if current > 0 else score
+            pie.set_count(candidate_id, new_val)
+
+        return pie
+
+    def _apply_distance_weight(self, pie: ChancePie) -> ChancePie:
+        """
+        Placeholder / hook for distance weighting.
+        Full implementation requires per-distance data in the pie or re-query.
+        """
+        # For now a no-op so the sequence is defined.
+        # When richer per-distance data is available in the pie,
+        # this will mutate using self.distance_mode and self.k.
+        return pie
+
+    def _apply_repetition_penalty(self, pie: ChancePie, recent_output: List[str]) -> ChancePie:
+        """Apply half-life repetition penalty: 2 ** -distance over the last max(5, pos) output tokens.
+
+        summed_penalty = sum(2 ** -d for each matching recent token at distance d)
+        final multiplier = 1.0 / (1.0 + summed_penalty)
+        """
+        if not recent_output:
+            return pie
+
+        window = max(5, len(recent_output))
+        recent = recent_output[-window:]
+
+        for candidate_id in pie.candidates():
+            summed_penalty = 0.0
+            for i, tok_str in enumerate(reversed(recent)):
+                d = i + 1
+                tok_id = self._ensure_token_id(tok_str)
+                if tok_id == candidate_id:
+                    summed_penalty += (2 ** -d)
+
+            if summed_penalty > 0:
+                current = pie.get_count(candidate_id)
+                factor = 1.0 / (1.0 + summed_penalty)
+                pie.set_count(candidate_id, current * factor)
+
+        return pie
+
     def get_next_token(self, context: List[str]) -> Optional[str]:
         """Two-stage selection. Works with integer token_ids internally."""
         # Convert incoming strings to IDs as early as possible
@@ -241,13 +339,15 @@ class WorkPicker:
         if not context_ids:
             return None
 
+        # Raw data from DB (no heuristics applied yet)
         broad_pie = ChancePie.from_context(
             self.conn,
-            context,                    # from_context still accepts strings for convenience (it resolves internally)
+            context,   # convenience: still accepts strings, resolves inside
             window_size=self.window_size,
-            distance_mode=self.distance_mode,
-            k=self.k,
         )
+
+        # Apply all weights/heuristics in defined sequence
+        broad_pie = self._apply_weights(broad_pie, context_ids, context)
 
         # Stage 1: Broad sampling using repeated .get() (returns token_ids)
         shortlist: List[int] = []
@@ -276,13 +376,18 @@ class WorkPicker:
 
         return self._token_text(chosen_id)
 
-    def generate_reply(self, text: str, *, rng: random.Random | None = None) -> str:
+    def generate_reply(self, text: str, *, rng: random.Random | None = None, target_len: int | None = None) -> str:
         """
         High-level convenience method that mimics the old generate_reply behavior.
 
         Generates a reply whose length is roughly 0.75x – 1.25x the number of
-        tokens in the input query. This is the method the web UI and other
-        higher-level callers should use instead of manually driving get_next_token.
+        tokens in the input query (unless target_len is provided).
+
+        Args:
+            text: The prompt text.
+            rng: Optional random number generator for reproducibility.
+            target_len: If provided, overrides the automatic length calculation.
+                        Useful for debugging / long generations.
         """
         rng = rng or random.Random()
 
@@ -291,7 +396,8 @@ class WorkPicker:
         if user_len == 0:
             return "…"
 
-        target_len = max(1, int(user_len * rng.uniform(0.75, 1.25)))
+        if target_len is None:
+            target_len = max(5, int(user_len * rng.uniform(0.75, 1.25)))
 
         reply_tokens: list[str] = []
         context = list(user_tokens)
@@ -304,6 +410,10 @@ class WorkPicker:
             context.append(next_token)
 
         return " ".join(reply_tokens) if reply_tokens else "…"
+
+    def debug_generate_100_tokens(self, prompt: str = "Why is the sky blue?") -> str:
+        """Convenience debug method: generate exactly 100 tokens for the given prompt."""
+        return self.generate_reply(prompt, target_len=100)
 
     def _pad_to_window(self, context: List[str]) -> List[str]:
         """Keep the last `window_size` tokens; pad on the left with ``<PAD>`` if needed."""

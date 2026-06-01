@@ -6,7 +6,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
-from .db import get_or_create_token_id, get_or_create_token_ids, init_schema
+from .db import build_token_pair_stats, get_or_create_token_id, get_or_create_token_ids, init_schema
 from .tokenizer import tokenize
 from .utils import canonical_index_path, file_stat_fingerprint, read_text_robust
 
@@ -203,6 +203,9 @@ class ContextBuilder:
                 )
             for file_path in files_list:
                 self._upsert_file_metadata_in_tx(conn, canonical_index_path(file_path), file_path)
+
+        # Build convenience tables for fast lookups (e.g. bayes_weight)
+        build_token_pair_stats(conn)
 
         return len(files_list)
 

@@ -29,6 +29,17 @@ CREATE TABLE IF NOT EXISTS cooccurrence (
 
 CREATE INDEX IF NOT EXISTS idx_co_token_distance ON cooccurrence(token_id, distance);
 CREATE INDEX IF NOT EXISTS idx_co_neighbor ON cooccurrence(neighbor_id);
+
+-- Convenience table for fast bayes_weight / relevance lookups
+-- Populated at index time from cooccurrence
+CREATE TABLE IF NOT EXISTS token_pair_stats (
+    token_a INTEGER NOT NULL,
+    token_b INTEGER NOT NULL,
+    distance_sum REAL NOT NULL,           -- sum(distance * count) for directed pair (a as neighbor, b as target)
+    PRIMARY KEY (token_a, token_b)
+);
+
+CREATE INDEX IF NOT EXISTS idx_token_pair_b ON token_pair_stats(token_b);
 """
 
 
@@ -48,6 +59,22 @@ def connect_db(db_path: str) -> sqlite3.Connection:
 def init_schema(conn: sqlite3.Connection) -> None:
 	conn.executescript(SCHEMA_SQL)
 	conn.commit()
+
+
+def build_token_pair_stats(conn: sqlite3.Connection) -> None:
+    """Populate token_pair_stats from existing cooccurrence data.
+    This creates fast lookup rows for bayes_weight calculations.
+    Should be called after major indexing / rebuild.
+    """
+    conn.execute("DELETE FROM token_pair_stats")
+
+    conn.execute("""
+        INSERT INTO token_pair_stats (token_a, token_b, distance_sum)
+        SELECT neighbor_id, token_id, SUM(distance * count)
+        FROM cooccurrence
+        GROUP BY neighbor_id, token_id
+    """)
+    conn.commit()
 
 
 def safe_execute(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> sqlite3.Cursor:
