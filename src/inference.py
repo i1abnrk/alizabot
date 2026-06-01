@@ -18,6 +18,19 @@ from bisect import bisect_left
 _CONTEXT_PAD = "<PAD>"
 
 
+def bayes_weight(candidate: str, **kwargs) -> float:
+    """
+    Placeholder for the Bayesian component of candidate scoring.
+
+    Currently returns 1.0 (neutral) until a real weight calculation is decided.
+
+    Future usage example (as described):
+        for each candidate in pie:
+            pie.set_value( get_value(candidate) * bayes_weight(candidate) )
+    """
+    return 1.0
+
+
 @dataclass
 class WeightedToken:
     token: str
@@ -26,64 +39,74 @@ class WeightedToken:
 
 
 class ChancePie:
-    """Weighted roulette wheel sampler (two-stage)."""
+    """Weighted roulette wheel sampler (two-stage).
+
+    Follows the spirit of the original AbstractChancePie:
+    - Accepts weighted candidates
+    - Normalizes internally to a probability distribution (weights sum to 1.0)
+    - Selection is performed in the [0, 1) probability space
+    """
 
     def __init__(self, weighted_tokens: List[WeightedToken]) -> None:
         self._tokens: List[WeightedToken] = list(weighted_tokens)
-        self._weights: List[float] = [max(0.0, float(t.weight)) for t in self._tokens]
-        self._cumulative: List[float] = []
+        raw_weights = [max(0.0, float(t.weight)) for t in self._tokens]
 
+        total = sum(raw_weights)
+        if total > 0.0:
+            self._probs: List[float] = [w / total for w in raw_weights]
+        else:
+            self._probs = [0.0] * len(raw_weights)
+
+        # Build cumulative distribution over the normalized probabilities (sums to ~1.0)
+        self._cumulative: List[float] = []
         running = 0.0
-        for w in self._weights:
-            running += w
+        for p in self._probs:
+            running += p
             self._cumulative.append(running)
 
-        self._total_weight: float = running
+        # Clamp last value to exactly 1.0
+        if self._cumulative:
+            self._cumulative[-1] = 1.0
 
     def pick(self) -> Optional[str]:
-        if not self._tokens or self._total_weight <= 0.0:
+        """Alias for next() for backward compatibility."""
+        return self.next()
+
+    def next(self) -> Optional[str]:
+        """Return one sample using the normalized probability distribution [0, 1)."""
+        if not self._tokens or not any(p > 0 for p in self._probs):
             return None
 
-        needle = random.random() * self._total_weight
+        # Sample in the normalized [0, 1) probability space
+        needle = random.random()
         idx = bisect_left(self._cumulative, needle)
         if idx >= len(self._tokens):
             idx = len(self._tokens) - 1
         return self._tokens[idx].token
 
     def sample_n(self, n: int) -> List[WeightedToken]:
-        """Return up to n unique weighted tokens (used for first stage ~121)."""
-        if n <= 0 or not self._tokens or self._total_weight <= 0.0:
-            return []
-
-        max_unique = sum(1 for w in self._weights if w > 0.0)
-        target = min(n, max_unique)
-        if target <= 0:
+        """Return up to n unique tokens by repeatedly calling next() (kept for compatibility/experiments)."""
+        if n <= 0 or not self._tokens:
             return []
 
         chosen: List[WeightedToken] = []
-        seen_ids: set = set()
-
-        # Oversample with replacement, then dedupe by token_id (or text if id is 0).
-        max_attempts = max(target * 6, len(self._tokens) * 2)
+        seen: set = set()
         attempts = 0
+        max_attempts = max(n * 8, len(self._tokens) * 3)
 
-        while len(chosen) < target and attempts < max_attempts:
+        while len(chosen) < n and attempts < max_attempts:
             attempts += 1
-            needle = random.random() * self._total_weight
-            idx = bisect_left(self._cumulative, needle)
-            if idx >= len(self._tokens):
-                idx = len(self._tokens) - 1
+            token_str = self.next()
+            if token_str is None:
+                break
 
-            tok = self._tokens[idx]
-            if self._weights[idx] <= 0.0:
-                continue
-
-            uniqueness_key = ("id", tok.token_id) if tok.token_id != 0 else ("token", tok.token)
-            if uniqueness_key in seen_ids:
-                continue
-
-            seen_ids.add(uniqueness_key)
-            chosen.append(tok)
+            for wt in self._tokens:
+                if wt.token == token_str:
+                    key = ("id", wt.token_id) if wt.token_id != 0 else ("token", wt.token)
+                    if key not in seen:
+                        seen.add(key)
+                        chosen.append(wt)
+                    break
 
         return chosen
 
@@ -105,18 +128,47 @@ class WorkPicker:
         self.window_size = window_size         # context window size (BERT-style "stride")
 
     def get_next_token(self, context: List[str]) -> Optional[str]:
-        """Given a list of previous tokens, return the next token."""
-        weighted = self._get_weighted_candidates(context)
-        if not weighted:
+        """Given a list of previous tokens, return the next token.
+
+        This implements the classic two-stage ChancePie selection:
+        1. Instantiate a ChancePie over all weighted candidates.
+        2. Call .next() first_stage_size times (with deduplication) to build a shortlist.
+        3. Instantiate a second ChancePie over the shortlist and call .next() once.
+        """
+        candidates = self._get_weighted_candidates(context)
+        if not candidates:
             return None
 
-        broad = ChancePie(weighted)
-        shortlist = broad.sample_n(self.first_stage_size)
+        # Stage 1: Broad sampling - instantiate ChancePie and drive it directly
+        broad_pie = ChancePie(candidates)
+
+        shortlist: List[WeightedToken] = []
+        seen: set = set()
+        attempts = 0
+        max_attempts = max(self.first_stage_size * 8, len(candidates) * 3)
+
+        while len(shortlist) < self.first_stage_size and attempts < max_attempts:
+            attempts += 1
+            token = broad_pie.next()
+            if token is None:
+                break
+
+            # Find the corresponding WeightedToken for deduping
+            # (we use token_id when available for uniqueness)
+            for wt in candidates:
+                if wt.token == token:
+                    key = ("id", wt.token_id) if wt.token_id != 0 else ("token", wt.token)
+                    if key not in seen:
+                        seen.add(key)
+                        shortlist.append(wt)
+                    break
+
         if not shortlist:
             return None
 
-        final = ChancePie(shortlist)
-        return final.pick()
+        # Stage 2: Final selection from the shortlist
+        final_pie = ChancePie(shortlist)
+        return final_pie.next()
 
     def generate_reply(self, text: str, *, rng: random.Random | None = None) -> str:
         """
@@ -156,11 +208,18 @@ class WorkPicker:
         return tail
 
     def _get_weighted_candidates(self, context: List[str]) -> List[WeightedToken]:
-        """Core logic: for each of the last `window_size` tokens, get candidates at that distance,
-        compute (count / total_at_d) * distance_weight, then combine scores.
+        """Compute the initial weighted candidate list for a ChancePie.
 
-        distance_weight = (1+k) ** distance      if distance_mode else
-                          (1+k) ** (window_size - distance)
+        For each context token at its distance we compute:
+            base_fitness = count / total_at_distance
+            final_weight = base_fitness * distance_weight * bayes_weight(candidate)
+
+        The bayes_weight() function is currently a dummy that returns 1.0.
+        When a real Bayesian weight calculation is ready, it will be applied here
+        (following the pattern: pie.set_value(get_value(candidate) * bayes_weight(candidate)) ).
+
+        The resulting list of WeightedToken is passed to ChancePie for
+        two-stage selection.
         """
         window = self._pad_to_window(context)
         # Map context surface forms to ids (unknown tokens, including PAD, are skipped).
@@ -207,8 +266,10 @@ class WorkPicker:
                 (neighbor_id, distance),
             )
             for token_id, count in cur:
-                contrib = (float(count) / total) * boost
-                scores[int(token_id)] += contrib
+                base_fitness = (float(count) / total) if total > 0.0 else 0.0
+                bw = bayes_weight(surface)   # placeholder (currently returns 1.0)
+                weight = base_fitness * boost * bw
+                scores[int(token_id)] += weight
 
         if not scores:
             return []
