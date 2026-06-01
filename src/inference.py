@@ -39,76 +39,154 @@ class WeightedToken:
 
 
 class ChancePie:
-    """Weighted roulette wheel sampler (two-stage).
+    """Custom in-memory data view representing token counts from the database.
 
-    Follows the spirit of the original AbstractChancePie:
-    - Accepts weighted candidates
-    - Normalizes internally to a probability distribution (weights sum to 1.0)
-    - Selection is performed in the [0, 1) probability space
+    Keys are strictly **integer token_ids** internally (faster, less error-prone).
+    Strings are only resolved at final output time.
+
+    Core API (inspired by alizagameapi ChancePie):
+      - put(token_id: int, count: float = 1.0)
+      - get(arc: float = None) -> Optional[int]
+      - theta(token_id: int) -> float     # cumulative arc at which this token starts
     """
 
-    def __init__(self, weighted_tokens: List[WeightedToken]) -> None:
-        self._tokens: List[WeightedToken] = list(weighted_tokens)
-        raw_weights = [max(0.0, float(t.weight)) for t in self._tokens]
+    def __init__(self) -> None:
+        self._counts: Dict[int, float] = {}
+        self._total: float = 0.0
+        self._cumulative: List[Tuple[int, float]] = []
+        self._dirty = True
 
-        total = sum(raw_weights)
-        if total > 0.0:
-            self._probs: List[float] = [w / total for w in raw_weights]
-        else:
-            self._probs = [0.0] * len(raw_weights)
+    def put(self, token_id: int, count: float = 1.0) -> None:
+        """Add/increment count for a token_id."""
+        if count <= 0:
+            return
+        self._counts[token_id] = self._counts.get(token_id, 0.0) + count
+        self._total += count
+        self._dirty = True
 
-        # Build cumulative distribution over the normalized probabilities (sums to ~1.0)
-        self._cumulative: List[float] = []
+    def _rebuild(self) -> None:
+        if not self._dirty:
+            return
+        if self._total <= 0:
+            self._cumulative = []
+            self._dirty = False
+            return
+
+        # Sort by token_id for deterministic order
+        sorted_items = sorted(self._counts.items())
+
+        self._cumulative = []
         running = 0.0
-        for p in self._probs:
-            running += p
-            self._cumulative.append(running)
+        for tid, cnt in sorted_items:
+            if cnt > 0:
+                running += cnt / self._total
+                self._cumulative.append((tid, running))
 
-        # Clamp last value to exactly 1.0
         if self._cumulative:
-            self._cumulative[-1] = 1.0
+            self._cumulative[-1] = (self._cumulative[-1][0], 1.0)
 
-    def pick(self) -> Optional[str]:
-        """Alias for next() for backward compatibility."""
-        return self.next()
+        self._dirty = False
 
-    def next(self) -> Optional[str]:
-        """Return one sample using the normalized probability distribution [0, 1)."""
-        if not self._tokens or not any(p > 0 for p in self._probs):
+    def get(self, arc: Optional[float] = None) -> Optional[int]:
+        """Return token_id at the given normalized arc in [0, 1)."""
+        self._rebuild()
+        if not self._cumulative:
             return None
 
-        # Sample in the normalized [0, 1) probability space
-        needle = random.random()
-        idx = bisect_left(self._cumulative, needle)
-        if idx >= len(self._tokens):
-            idx = len(self._tokens) - 1
-        return self._tokens[idx].token
+        if arc is None:
+            arc = random.random()
 
-    def sample_n(self, n: int) -> List[WeightedToken]:
-        """Return up to n unique tokens by repeatedly calling next() (kept for compatibility/experiments)."""
-        if n <= 0 or not self._tokens:
-            return []
+        idx = bisect_left([c for _, c in self._cumulative], arc)
+        if idx >= len(self._cumulative):
+            idx = len(self._cumulative) - 1
+        return self._cumulative[idx][0]
 
-        chosen: List[WeightedToken] = []
-        seen: set = set()
-        attempts = 0
-        max_attempts = max(n * 8, len(self._tokens) * 3)
+    def theta(self, token_id: int) -> float:
+        """Return the cumulative arc (in [0,1)) at which this token_id would start being selected.
 
-        while len(chosen) < n and attempts < max_attempts:
-            attempts += 1
-            token_str = self.next()
-            if token_str is None:
-                break
+        Inverse of get(arc). Follows the logic from ChancePie3.java.
+        """
+        self._rebuild()
+        if token_id not in self._counts or self._total <= 0:
+            return 0.0
 
-            for wt in self._tokens:
-                if wt.token == token_str:
-                    key = ("id", wt.token_id) if wt.token_id != 0 else ("token", wt.token)
-                    if key not in seen:
-                        seen.add(key)
-                        chosen.append(wt)
-                    break
+        cumulative_before = 0.0
+        for tid, cum in self._cumulative:
+            if tid == token_id:
+                return cumulative_before
+            cumulative_before = cum
+        return 0.0
 
-        return chosen
+    # Aliases
+    def next(self) -> Optional[int]:
+        return self.get()
+
+    def pick(self) -> Optional[int]:
+        return self.get()
+
+    @classmethod
+    def from_context(
+        cls,
+        conn: sqlite3.Connection,
+        context: List[str],
+        window_size: int = 5,
+        distance_mode: bool = True,
+        k: float = 0.04,
+    ) -> "ChancePie":
+        """Builds a ChancePie directly from DB using integer token_ids.
+
+        Distance weighting is applied at population time via weighted put().
+        """
+        n = window_size
+        tail = list(context[-n:]) if len(context) >= n else list(context)
+        if len(tail) < n:
+            tail = [_CONTEXT_PAD] * (n - len(tail)) + tail
+
+        window = tail
+
+        # Resolve context strings to IDs
+        rows = conn.execute(
+            f"SELECT text, id FROM tokens WHERE text IN ({','.join('?' * len(window))})",
+            window,
+        ).fetchall()
+        text_to_id: Dict[str, int] = {str(t): int(i) for t, i in rows}
+
+        pie = cls()
+
+        for slot, surface in enumerate(window):
+            distance = n - slot
+            neighbor_id = text_to_id.get(surface)
+            if neighbor_id is None:
+                continue
+
+            (total_at_d,) = conn.execute(
+                "SELECT COALESCE(SUM(count), 0) FROM cooccurrence "
+                "WHERE neighbor_id = ? AND distance = ?",
+                (neighbor_id, distance),
+            ).fetchone()
+
+            total = float(total_at_d)
+            if total <= 0.0:
+                continue
+
+            if distance_mode:
+                dist_weight = (1 + k) ** distance
+            else:
+                dist_weight = (1 + k) ** (n - distance)
+
+            cur = conn.execute(
+                "SELECT token_id, count FROM cooccurrence "
+                "WHERE neighbor_id = ? AND distance = ?",
+                (neighbor_id, distance),
+            )
+
+            for token_id, count in cur:
+                base = (float(count) / total) if total > 0 else 0.0
+                effective = base * dist_weight
+                if effective > 0:
+                    pie.put(int(token_id), effective)
+
+        return pie
 
 
 class WorkPicker:
@@ -124,51 +202,79 @@ class WorkPicker:
         self.conn = sqlite3.connect(db_path)
         self.k = k
         self.first_stage_size = first_stage_size
-        self.distance_mode = distance_mode     # boolean control surface
-        self.window_size = window_size         # context window size (BERT-style "stride")
+        self.distance_mode = distance_mode
+        self.window_size = window_size
+
+        # String <-> ID caches (populated on demand)
+        self._text_to_id: Dict[str, int] = {}
+        self._id_to_text: Dict[int, str] = {}
+
+    def _ensure_token_id(self, text: str) -> Optional[int]:
+        if text in self._text_to_id:
+            return self._text_to_id[text]
+        row = self.conn.execute("SELECT id FROM tokens WHERE text = ?", (text,)).fetchone()
+        if row:
+            tid = int(row[0])
+            self._text_to_id[text] = tid
+            self._id_to_text[tid] = text
+            return tid
+        return None
+
+    def _token_text(self, token_id: int) -> str:
+        if token_id in self._id_to_text:
+            return self._id_to_text[token_id]
+        row = self.conn.execute("SELECT text FROM tokens WHERE id = ?", (token_id,)).fetchone()
+        text = str(row[0]) if row else ""
+        self._id_to_text[token_id] = text
+        self._text_to_id[text] = token_id
+        return text
 
     def get_next_token(self, context: List[str]) -> Optional[str]:
-        """Given a list of previous tokens, return the next token.
+        """Two-stage selection. Works with integer token_ids internally."""
+        # Convert incoming strings to IDs as early as possible
+        context_ids: List[int] = []
+        for t in context:
+            tid = self._ensure_token_id(t)
+            if tid is not None:
+                context_ids.append(tid)
 
-        This implements the classic two-stage ChancePie selection:
-        1. Instantiate a ChancePie over all weighted candidates.
-        2. Call .next() first_stage_size times (with deduplication) to build a shortlist.
-        3. Instantiate a second ChancePie over the shortlist and call .next() once.
-        """
-        candidates = self._get_weighted_candidates(context)
-        if not candidates:
+        if not context_ids:
             return None
 
-        # Stage 1: Broad sampling - instantiate ChancePie and drive it directly
-        broad_pie = ChancePie(candidates)
+        broad_pie = ChancePie.from_context(
+            self.conn,
+            context,                    # from_context still accepts strings for convenience (it resolves internally)
+            window_size=self.window_size,
+            distance_mode=self.distance_mode,
+            k=self.k,
+        )
 
-        shortlist: List[WeightedToken] = []
+        # Stage 1: Broad sampling using repeated .get() (returns token_ids)
+        shortlist: List[int] = []
         seen: set = set()
         attempts = 0
-        max_attempts = max(self.first_stage_size * 8, len(candidates) * 3)
+        max_attempts = max(self.first_stage_size * 10, 2000)
 
         while len(shortlist) < self.first_stage_size and attempts < max_attempts:
             attempts += 1
-            token = broad_pie.next()
-            if token is None:
-                break
-
-            # Find the corresponding WeightedToken for deduping
-            # (we use token_id when available for uniqueness)
-            for wt in candidates:
-                if wt.token == token:
-                    key = ("id", wt.token_id) if wt.token_id != 0 else ("token", wt.token)
-                    if key not in seen:
-                        seen.add(key)
-                        shortlist.append(wt)
-                    break
+            tid = broad_pie.get()
+            if tid is not None and tid != 0 and tid not in seen:   # 0 is not a real token
+                seen.add(tid)
+                shortlist.append(tid)
 
         if not shortlist:
             return None
 
-        # Stage 2: Final selection from the shortlist
-        final_pie = ChancePie(shortlist)
-        return final_pie.next()
+        # Stage 2: Final pie from shortlist (equal weight for now)
+        final_pie = ChancePie()
+        for tid in shortlist:
+            final_pie.put(tid, 1.0)
+
+        chosen_id = final_pie.get()
+        if chosen_id is None:
+            return None
+
+        return self._token_text(chosen_id)
 
     def generate_reply(self, text: str, *, rng: random.Random | None = None) -> str:
         """
@@ -208,93 +314,21 @@ class WorkPicker:
         return tail
 
     def _get_weighted_candidates(self, context: List[str]) -> List[WeightedToken]:
-        """Compute the initial weighted candidate list for a ChancePie.
+        """Thin wrapper — delegates to ChancePie.from_context for the DB work.
 
-        For each context token at its distance we compute:
-            base_fitness = count / total_at_distance
-            final_weight = base_fitness * distance_weight * bayes_weight(candidate)
-
-        The bayes_weight() function is currently a dummy that returns 1.0.
-        When a real Bayesian weight calculation is ready, it will be applied here
-        (following the pattern: pie.set_value(get_value(candidate) * bayes_weight(candidate)) ).
-
-        The resulting list of WeightedToken is passed to ChancePie for
-        two-stage selection.
+        This method is kept for backward compatibility during the transition.
+        The real DB + distance weighting logic now lives in ChancePie.
         """
-        window = self._pad_to_window(context)
-        # Map context surface forms to ids (unknown tokens, including PAD, are skipped).
-        rows = self.conn.execute(
-            f"SELECT text, id FROM tokens WHERE text IN ({','.join('?' * len(window))})",
-            window,
-        ).fetchall()
-        text_to_id: Dict[str, int] = {str(t): int(i) for t, i in rows}
-
-        scores: Dict[int, float] = defaultdict(float)
-
-        for slot, surface in enumerate(window):
-            distance = self.window_size - slot
-            neighbor_id = text_to_id.get(surface)
-            if neighbor_id is None:
-                continue
-
-            (total_at_d,) = self.conn.execute(
-                """
-                SELECT COALESCE(SUM(count), 0)
-                FROM cooccurrence
-                WHERE neighbor_id = ? AND distance = ?
-                """,
-                (neighbor_id, distance),
-            ).fetchone()
-            total = float(total_at_d)
-            if total <= 0.0:
-                continue
-
-            # distance_weight formula as specified:
-            # (1+k) ** distance if distance_mode else (window_size - distance)
-            if self.distance_mode:
-                dist_weight = (1 + self.k) ** distance
-            else:
-                dist_weight = (1 + self.k) ** (self.window_size - distance)
-
-            boost = dist_weight
-            cur = self.conn.execute(
-                """
-                SELECT token_id, count
-                FROM cooccurrence
-                WHERE neighbor_id = ? AND distance = ?
-                """,
-                (neighbor_id, distance),
-            )
-            for token_id, count in cur:
-                base_fitness = (float(count) / total) if total > 0.0 else 0.0
-                bw = bayes_weight(surface)   # placeholder (currently returns 1.0)
-                weight = base_fitness * boost * bw
-                scores[int(token_id)] += weight
-
-        if not scores:
-            return []
-
-        ids = list(scores.keys())
-        placeholders = ",".join("?" * len(ids))
-        id_to_text = {
-            int(i): str(t)
-            for i, t in self.conn.execute(
-                f"SELECT id, text FROM tokens WHERE id IN ({placeholders})",
-                ids,
-            )
-        }
-
-        # +1 prior on every candidate so nothing has zero mass after combining distances.
-        prior = 1.0
-        return [
-            WeightedToken(
-                token=id_to_text.get(tid, ""),
-                weight=scores[tid] + prior,
-                token_id=tid,
-            )
-            for tid in ids
-            if tid in id_to_text
-        ]
+        pie = ChancePie.from_context(
+            self.conn,
+            context,
+            window_size=self.window_size,
+            distance_mode=self.distance_mode,
+            k=self.k,
+        )
+        # Return the internal list so existing code that expects List[WeightedToken] still works.
+        # In the future we may return the pie itself.
+        return list(pie._tokens)
 
 
 def test_picker() -> None:
